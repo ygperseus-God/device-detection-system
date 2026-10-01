@@ -1,0 +1,1153 @@
+--!strict
+-- Softboyz Secure Combat
+-- Server-authoritative gun system for a Roblox game you own/control.
+--
+-- Required:
+--   ReplicatedStorage
+--     Blaster
+--       Remotes
+--         Shoot : RemoteEvent
+--         ReplicateShot : RemoteEvent
+--
+-- Optional:
+--   ReplicatedStorage
+--     Blaster
+--       Remotes
+--         CombatState : RemoteEvent
+--
+-- Supported weapon names:
+--   SP
+--   COMBAT.P
+--   AK47
+--   SCARL
+--   PISTOL.50
+--   PISTOL
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Blaster = ReplicatedStorage:WaitForChild("Blaster")
+local Remotes = Blaster:WaitForChild("Remotes")
+
+local Shoot = Remotes:WaitForChild("Shoot") :: RemoteEvent
+local ReplicateShot = Remotes:WaitForChild("ReplicateShot") :: RemoteEvent
+
+local CombatState = Remotes:FindFirstChild("CombatState") :: RemoteEvent?
+if not CombatState then
+	CombatState = Instance.new("RemoteEvent")
+	CombatState.Name = "CombatState"
+	CombatState.Parent = Remotes
+end
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+
+type WeaponConfig = {
+	Damage: number,
+	HeadMultiplier: number,
+	Range: number,
+	FireRate: number,
+	MagazineSize: number,
+	ReloadTime: number,
+	SpreadDegrees: number,
+	OriginTolerance: number,
+	MaxAimAngleDegrees: number,
+	Automatic: boolean,
+}
+
+local WEAPONS: {[string]: WeaponConfig} = {
+	["SP"] = {
+		Damage = 25,
+		HeadMultiplier = 2.0,
+		Range = 700,
+		FireRate = 4,
+		MagazineSize = 6,
+		ReloadTime = 1.8,
+		SpreadDegrees = 1.25,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = false,
+	},
+
+	["COMBAT.P"] = {
+		Damage = 22,
+		HeadMultiplier = 2.0,
+		Range = 650,
+		FireRate = 6,
+		MagazineSize = 12,
+		ReloadTime = 1.5,
+		SpreadDegrees = 1.5,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = false,
+	},
+
+	["AK47"] = {
+		Damage = 30,
+		HeadMultiplier = 2.0,
+		Range = 1000,
+		FireRate = 10,
+		MagazineSize = 30,
+		ReloadTime = 2.2,
+		SpreadDegrees = 1.8,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = true,
+	},
+
+	["SCARL"] = {
+		Damage = 27,
+		HeadMultiplier = 2.0,
+		Range = 1000,
+		FireRate = 11,
+		MagazineSize = 30,
+		ReloadTime = 2.0,
+		SpreadDegrees = 1.6,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = true,
+	},
+
+	["PISTOL.50"] = {
+		Damage = 42,
+		HeadMultiplier = 2.1,
+		Range = 750,
+		FireRate = 4.5,
+		MagazineSize = 7,
+		ReloadTime = 1.7,
+		SpreadDegrees = 1.2,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = false,
+	},
+
+	["PISTOL"] = {
+		Damage = 20,
+		HeadMultiplier = 2.0,
+		Range = 650,
+		FireRate = 7,
+		MagazineSize = 15,
+		ReloadTime = 1.4,
+		SpreadDegrees = 1.7,
+		OriginTolerance = 8,
+		MaxAimAngleDegrees = 8,
+		Automatic = false,
+	},
+}
+
+---------------------------------------------------------------------
+-- STATE
+---------------------------------------------------------------------
+
+type WeaponState = {
+	Ammo: number,
+	LastShot: number,
+	Reloading: boolean,
+	ReloadToken: number,
+	Sequence: number,
+	Shots: number,
+	Hits: number,
+	Headshots: number,
+	Damage: number,
+	Violations: number,
+}
+
+type PlayerState = {
+	Weapons: {[string]: WeaponState},
+	LastRequest: number,
+	Requests: number,
+}
+
+local states: {[Player]: PlayerState} = {}
+
+local function createWeaponState(config: WeaponConfig): WeaponState
+	return {
+		Ammo = config.MagazineSize,
+		LastShot = -math.huge,
+		Reloading = false,
+		ReloadToken = 0,
+		Sequence = 0,
+		Shots = 0,
+		Hits = 0,
+		Headshots = 0,
+		Damage = 0,
+		Violations = 0,
+	}
+end
+
+local function createPlayerState(): PlayerState
+	local result: PlayerState = {
+		Weapons = {},
+		LastRequest = 0,
+		Requests = 0,
+	}
+
+	for weaponName, config in pairs(WEAPONS) do
+		result.Weapons[weaponName] = createWeaponState(config)
+	end
+
+	return result
+end
+
+local function getState(player: Player): PlayerState
+	local state = states[player]
+	if state then
+		return state
+	end
+
+	state = createPlayerState()
+	states[player] = state
+	return state
+end
+
+---------------------------------------------------------------------
+-- SECURITY HELPERS
+---------------------------------------------------------------------
+
+local function violation(player: Player, reason: string)
+	local state = getState(player)
+	state.Requests += 1
+
+	-- Only count suspicious requests; don't automatically punish here.
+	for _, weaponState in pairs(state.Weapons) do
+		weaponState.Violations += 0
+	end
+
+	warn(string.format(
+		"[SoftboyzSecurity] %s (%d): %s",
+		player.Name,
+		player.UserId,
+		reason
+	))
+
+	CombatState:FireClient(player, {
+		Type = "Security",
+		Status = "Rejected",
+		Reason = reason,
+	})
+end
+
+local function finiteNumber(value: unknown): boolean
+	return typeof(value) == "number" and value == value and value > -math.huge and value < math.huge
+end
+
+local function validVector3(value: unknown): boolean
+	if typeof(value) ~= "Vector3" then
+		return false
+	end
+
+	return finiteNumber(value.X)
+		and finiteNumber(value.Y)
+		and finiteNumber(value.Z)
+end
+
+local function safeUnit(vector: Vector3): Vector3?
+	if vector.Magnitude < 1e-5 then
+		return nil
+	end
+
+	return vector.Unit
+end
+
+---------------------------------------------------------------------
+-- CHARACTER / WEAPON VALIDATION
+---------------------------------------------------------------------
+
+local function getCharacter(player: Player): Model?
+	local character = player.Character
+	if not character then
+		return nil
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or humanoid.Health <= 0 or not root then
+		return nil
+	end
+
+	return character
+end
+
+local function getEquippedWeapon(player: Player): Tool?
+	local character = player.Character
+	if not character then
+		return nil
+	end
+
+	for _, child in ipairs(character:GetChildren()) do
+		if child:IsA("Tool") and WEAPONS[child.Name] then
+			return child
+		end
+	end
+
+	return nil
+end
+
+local function weaponMatchesRequest(player: Player, weaponName: string): boolean
+	local equipped = getEquippedWeapon(player)
+
+	if not equipped then
+		return false
+	end
+
+	return equipped.Name == weaponName
+end
+
+---------------------------------------------------------------------
+-- RAYCAST
+---------------------------------------------------------------------
+
+local function makeRaycastParams(character: Model): RaycastParams
+	local params = RaycastParams.new()
+
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {character}
+
+	params.IgnoreWater = true
+	params.RespectCanCollide = true
+
+	return params
+end
+
+local function findHumanoidFromHit(instance: Instance?): (Humanoid?, Model?, BasePart?)
+	if not instance then
+		return nil, nil, nil
+	end
+
+	local current: Instance? = instance
+
+	while current and current ~= Workspace do
+		if current:IsA("Model") then
+			local humanoid = current:FindFirstChildOfClass("Humanoid")
+
+			if humanoid then
+				local hitPart = if instance:IsA("BasePart") then instance else nil
+				return humanoid, current, hitPart
+			end
+		end
+
+		current = current.Parent
+	end
+
+	return nil, nil, nil
+end
+
+---------------------------------------------------------------------
+-- DAMAGE
+---------------------------------------------------------------------
+
+local function isFriendly(attacker: Player, victimModel: Model): boolean
+	local victimPlayer = Players:GetPlayerFromCharacter(victimModel)
+
+	if not victimPlayer then
+		return false
+	end
+
+	-- Standard team protection.
+	if attacker.Team ~= nil and victimPlayer.Team == attacker.Team then
+		return true
+	end
+
+	return false
+end
+
+local function calculateDamage(
+	config: WeaponConfig,
+	hitPart: BasePart?
+): (number, boolean)
+	local headshot = false
+
+	if hitPart then
+		headshot =
+			hitPart.Name == "Head"
+			or hitPart:GetAttribute("DamageZone") == "Head"
+	end
+
+	local damage = config.Damage
+
+	if headshot then
+		damage *= config.HeadMultiplier
+	end
+
+	return math.floor(damage + 0.5), headshot
+end
+
+---------------------------------------------------------------------
+-- SERVER SHOT
+---------------------------------------------------------------------
+
+local function processShot(
+	player: Player,
+	payload: any
+): boolean
+
+	if typeof(payload) ~= "table" then
+		violation(player, "payload_not_table")
+		return false
+	end
+
+	local weaponName = payload.weapon
+	local origin = payload.origin
+	local direction = payload.direction
+	local sequence = payload.sequence
+
+	if typeof(weaponName) ~= "string" then
+		violation(player, "invalid_weapon_name")
+		return false
+	end
+
+	local config = WEAPONS[weaponName]
+	if not config then
+		violation(player, "unknown_weapon")
+		return false
+	end
+
+	if not validVector3(origin) or not validVector3(direction) then
+		violation(player, "invalid_vector")
+		return false
+	end
+
+	if typeof(sequence) ~= "number"
+		or sequence % 1 ~= 0
+		or sequence < 1
+		or sequence > 2^31
+	then
+		violation(player, "invalid_sequence")
+		return false
+	end
+
+	local playerState = getState(player)
+	local weaponState = playerState.Weapons[weaponName]
+
+	if weaponState.Reloading then
+		violation(player, "shot_while_reloading")
+		return false
+	end
+
+	-- Replay protection.
+	if sequence <= weaponState.Sequence then
+		violation(player, "replayed_sequence")
+		return false
+	end
+
+	weaponState.Sequence = sequence
+
+	-----------------------------------------------------------------
+	-- RATE LIMIT
+	-----------------------------------------------------------------
+
+	local now = os.clock()
+	local minInterval = 1 / config.FireRate
+
+	if now - weaponState.LastShot < minInterval * 0.88 then
+		violation(player, "fire_rate_exceeded")
+		return false
+	end
+
+	weaponState.LastShot = now
+
+	-----------------------------------------------------------------
+	-- EQUIPPED WEAPON
+	-----------------------------------------------------------------
+
+	if not weaponMatchesRequest(player, weaponName) then
+		violation(player, "weapon_not_equipped")
+		return false
+	end
+
+	-----------------------------------------------------------------
+	-- CHARACTER
+	-----------------------------------------------------------------
+
+	local character = getCharacter(player)
+	if not character then
+		return false
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not root then
+		return false
+	end
+
+	-----------------------------------------------------------------
+	-- ORIGIN VALIDATION
+	-----------------------------------------------------------------
+
+	local muzzle = character:FindFirstChild("Muzzle", true)
+
+	local expectedOrigin = root.Position
+
+	if muzzle and muzzle:IsA("BasePart") then
+		expectedOrigin = muzzle.Position
+	end
+
+	if (origin - expectedOrigin).Magnitude > config.OriginTolerance then
+		violation(player, "invalid_shot_origin")
+		return false
+	end
+
+	-----------------------------------------------------------------
+	-- DIRECTION VALIDATION
+	-----------------------------------------------------------------
+
+	local unitDirection = safeUnit(direction)
+	if not unitDirection then
+		violation(player, "zero_direction")
+		return false
+	end
+
+	-- The server does not accept arbitrary impossible directions.
+	-- We compare to the server-visible root orientation as a basic sanity
+	-- gate. A more advanced implementation can use replicated camera data
+	-- from the game's own controller.
+	local forward = root.CFrame.LookVector
+	local dot = math.clamp(forward:Dot(unitDirection), -1, 1)
+	local angle = math.deg(math.acos(dot))
+
+	if angle > config.MaxAimAngleDegrees + 85 then
+		violation(player, "impossible_shot_angle")
+		return false
+	end
+
+	-----------------------------------------------------------------
+	-- AMMO
+	-----------------------------------------------------------------
+
+	if weaponState.Ammo <= 0 then
+		CombatState:FireClient(player, {
+			Type = "Ammo",
+			Weapon = weaponName,
+			Ammo = 0,
+			MagazineSize = config.MagazineSize,
+		})
+
+		return false
+	end
+
+	weaponState.Ammo -= 1
+	weaponState.Shots += 1
+
+	-----------------------------------------------------------------
+	-- RAYCAST
+	-----------------------------------------------------------------
+
+	local params = makeRaycastParams(character)
+
+	local result = Workspace:Raycast(
+		origin,
+		unitDirection * config.Range,
+		params
+	)
+
+	local hitPosition =
+		if result
+		then result.Position
+		else origin + unitDirection * config.Range
+
+	local hitHumanoid: Humanoid?
+	local hitModel: Model?
+	local hitPart: BasePart?
+
+	if result then
+		hitHumanoid, hitModel, hitPart = findHumanoidFromHit(result.Instance)
+	end
+
+	-----------------------------------------------------------------
+	-- DAMAGE
+	-----------------------------------------------------------------
+
+	local didHit = false
+	local damageDone = 0
+	local headshot = false
+
+	if hitHumanoid and hitModel and hitPart then
+		if hitHumanoid.Health > 0 and not isFriendly(player, hitModel) then
+			damageDone, headshot = calculateDamage(config, hitPart)
+
+			-- Server decides the damage.
+			hitHumanoid:TakeDamage(damageDone)
+
+			didHit = true
+			weaponState.Hits += 1
+			weaponState.Damage += damageDone
+
+			if headshot then
+				weaponState.Headshots += 1
+			end
+		end
+	end
+
+	-----------------------------------------------------------------
+	-- REPLICATION
+	-----------------------------------------------------------------
+
+	ReplicateShot:FireAllClients({
+		Type = "Shot",
+		Player = player,
+		Weapon = weaponName,
+
+		Origin = origin,
+		HitPosition = hitPosition,
+
+		Hit = didHit,
+		Headshot = headshot,
+		Damage = damageDone,
+
+		Sequence = sequence,
+	})
+
+	CombatState:FireClient(player, {
+		Type = "Ammo",
+		Weapon = weaponName,
+		Ammo = weaponState.Ammo,
+		MagazineSize = config.MagazineSize,
+	})
+
+	return true
+end
+
+---------------------------------------------------------------------
+-- SHOOT REMOTE
+---------------------------------------------------------------------
+
+Shoot.OnServerEvent:Connect(function(player: Player, payload: any)
+	local ok, err = pcall(function()
+		processShot(player, payload)
+	end)
+
+	if not ok then
+		warn(string.format(
+			"[SoftboyzCombat] Shot error for %s: %s",
+			player.Name,
+			tostring(err)
+		))
+	end
+end)
+
+---------------------------------------------------------------------
+-- RELOAD
+---------------------------------------------------------------------
+
+local Reload = Remotes:FindFirstChild("Reload") :: RemoteEvent?
+
+if not Reload then
+	Reload = Instance.new("RemoteEvent")
+	Reload.Name = "Reload"
+	Reload.Parent = Remotes
+end
+
+local function reloadWeapon(player: Player, weaponName: string)
+	local config = WEAPONS[weaponName]
+	if not config then
+		return
+	end
+
+	local equipped = getEquippedWeapon(player)
+	if not equipped or equipped.Name ~= weaponName then
+		return
+	end
+
+	local state = getState(player)
+	local weaponState = state.Weapons[weaponName]
+
+	if weaponState.Reloading then
+		return
+	end
+
+	if weaponState.Ammo >= config.MagazineSize then
+		return
+	end
+
+	weaponState.Reloading = true
+	weaponState.ReloadToken += 1
+
+	local token = weaponState.ReloadToken
+
+	CombatState:FireClient(player, {
+		Type = "Reloading",
+		Weapon = weaponName,
+		Duration = config.ReloadTime,
+	})
+
+	task.delay(config.ReloadTime, function()
+		if not player.Parent then
+			return
+		end
+
+		local current = getState(player)
+		local currentWeapon = current.Weapons[weaponName]
+
+		if currentWeapon.ReloadToken ~= token then
+			return
+		end
+
+		currentWeapon.Reloading = false
+		currentWeapon.Ammo = config.MagazineSize
+
+		CombatState:FireClient(player, {
+			Type = "Ammo",
+			Weapon = weaponName,
+			Ammo = currentWeapon.Ammo,
+			MagazineSize = config.MagazineSize,
+		})
+	end)
+end
+
+Reload.OnServerEvent:Connect(function(player: Player, weaponName: any)
+	if typeof(weaponName) ~= "string" then
+		violation(player, "invalid_reload_weapon")
+		return
+	end
+
+	reloadWeapon(player, weaponName)
+end)
+
+---------------------------------------------------------------------
+-- PLAYER LIFECYCLE
+---------------------------------------------------------------------
+
+Players.PlayerAdded:Connect(function(player)
+	states[player] = createPlayerState()
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	states[player] = nil
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	states[player] = createPlayerState()
+end
+
+print("[SoftboyzCombat] Secure combat system online.")
+--!strict
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local Blaster = ReplicatedStorage:WaitForChild("Blaster")
+local Remotes = Blaster:WaitForChild("Remotes")
+
+local Shoot = Remotes:WaitForChild("Shoot") :: RemoteEvent
+local ReplicateShot = Remotes:WaitForChild("ReplicateShot") :: RemoteEvent
+local CombatState = Remotes:WaitForChild("CombatState") :: RemoteEvent
+local Reload = Remotes:WaitForChild("Reload") :: RemoteEvent
+
+local WEAPON_NAMES = {
+	["SP"] = true,
+	["COMBAT.P"] = true,
+	["AK47"] = true,
+	["SCARL"] = true,
+	["PISTOL.50"] = true,
+	["PISTOL"] = true,
+}
+
+---------------------------------------------------------------------
+-- CLIENT STATE
+---------------------------------------------------------------------
+
+local sequence = 0
+local equippedTool: Tool? = nil
+local ammo: {[string]: number} = {}
+local reloading = false
+
+local automaticLoop = false
+local firing = false
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "SoftboyzCombatHUD"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local ammoLabel = Instance.new("TextLabel")
+ammoLabel.Name = "Ammo"
+ammoLabel.AnchorPoint = Vector2.new(1, 1)
+ammoLabel.Position = UDim2.new(1, -30, 1, -30)
+ammoLabel.Size = UDim2.fromOffset(240, 55)
+ammoLabel.BackgroundTransparency = 1
+ammoLabel.TextColor3 = Color3.new(1, 1, 1)
+ammoLabel.TextStrokeTransparency = 0.2
+ammoLabel.Font = Enum.Font.GothamBold
+ammoLabel.TextSize = 24
+ammoLabel.TextXAlignment = Enum.TextXAlignment.Right
+ammoLabel.Text = "--"
+ammoLabel.Parent = gui
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.AnchorPoint = Vector2.new(0.5, 0)
+statusLabel.Position = UDim2.new(0.5, 0, 0, 20)
+statusLabel.Size = UDim2.fromOffset(420, 30)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.new(1, 1, 1)
+statusLabel.TextStrokeTransparency = 0.35
+statusLabel.Font = Enum.Font.GothamMedium
+statusLabel.TextSize = 15
+statusLabel.Text = "SOFTBOYZ // READY"
+statusLabel.Parent = gui
+
+local crosshair = Instance.new("TextLabel")
+crosshair.Name = "Crosshair"
+crosshair.AnchorPoint = Vector2.new(0.5, 0.5)
+crosshair.Position = UDim2.fromScale(0.5, 0.5)
+crosshair.Size = UDim2.fromOffset(30, 30)
+crosshair.BackgroundTransparency = 1
+crosshair.Text = "+"
+crosshair.TextColor3 = Color3.new(1, 1, 1)
+crosshair.TextStrokeTransparency = 0.35
+crosshair.Font = Enum.Font.GothamBold
+crosshair.TextSize = 22
+crosshair.Parent = gui
+
+---------------------------------------------------------------------
+-- HELPERS
+---------------------------------------------------------------------
+
+local function getCharacter(): Model?
+	return LocalPlayer.Character
+end
+
+local function getMuzzlePosition(): Vector3?
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+
+	local muzzle = character:FindFirstChild("Muzzle", true)
+
+	if muzzle and muzzle:IsA("BasePart") then
+		return muzzle.Position
+	end
+
+	local head = character:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head.Position
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root.Position
+	end
+
+	return nil
+end
+
+local function getCurrentWeapon(): Tool?
+	local character = getCharacter()
+
+	if not character then
+		return nil
+	end
+
+	for _, object in ipairs(character:GetChildren()) do
+		if object:IsA("Tool") and WEAPON_NAMES[object.Name] then
+			return object
+		end
+	end
+
+	return nil
+end
+
+local function updateHUD()
+	local tool = getCurrentWeapon()
+	equippedTool = tool
+
+	if not tool then
+		ammoLabel.Text = "--"
+		statusLabel.Text = "SOFTBOYZ // NO WEAPON"
+		return
+	end
+
+	local weaponName = tool.Name
+	local currentAmmo = ammo[weaponName]
+
+	if currentAmmo == nil then
+		currentAmmo = tool:GetAttribute("Ammo")
+	end
+
+	local magazine = tool:GetAttribute("magazineSize")
+
+	if typeof(currentAmmo) == "number" and typeof(magazine) == "number" then
+		ammoLabel.Text = string.format(
+			"%d / %d",
+			currentAmmo,
+			magazine
+		)
+	elseif typeof(currentAmmo) == "number" then
+		ammoLabel.Text = tostring(currentAmmo)
+	else
+		ammoLabel.Text = weaponName
+	end
+
+	statusLabel.Text = reloading
+		and string.format("%s // RELOADING", weaponName)
+		or string.format("%s // READY", weaponName)
+end
+
+---------------------------------------------------------------------
+-- SHOT
+---------------------------------------------------------------------
+
+local function fireOnce()
+	if reloading then
+		return
+	end
+
+	local tool = getCurrentWeapon()
+	if not tool then
+		return
+	end
+
+	local character = getCharacter()
+	if not character then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local origin = getMuzzlePosition()
+	if not origin then
+		return
+	end
+
+	local viewport = Camera.ViewportSize
+	local center = Vector2.new(
+		viewport.X * 0.5,
+		viewport.Y * 0.5
+	)
+
+	local ray = Camera:ViewportPointToRay(
+		center.X,
+		center.Y
+	)
+
+	local direction = ray.Direction
+
+	sequence += 1
+
+	Shoot:FireServer({
+		weapon = tool.Name,
+		origin = origin,
+		direction = direction,
+		sequence = sequence,
+	})
+end
+
+---------------------------------------------------------------------
+-- RELOAD
+---------------------------------------------------------------------
+
+local function reload()
+	local tool = getCurrentWeapon()
+
+	if not tool then
+		return
+	end
+
+	if reloading then
+		return
+	end
+
+	reloading = true
+
+	Reload:FireServer(tool.Name)
+
+	updateHUD()
+end
+
+---------------------------------------------------------------------
+-- INPUT
+---------------------------------------------------------------------
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		firing = true
+		fireOnce()
+
+	elseif input.KeyCode == Enum.KeyCode.R then
+		reload()
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		firing = false
+	end
+end)
+
+---------------------------------------------------------------------
+-- REMOTE STATE
+---------------------------------------------------------------------
+
+CombatState.OnClientEvent:Connect(function(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+
+	if data.Type == "Ammo" then
+		local weapon = data.Weapon
+
+		if typeof(weapon) == "string" and typeof(data.Ammo) == "number" then
+			ammo[weapon] = data.Ammo
+		end
+
+		reloading = false
+		updateHUD()
+
+	elseif data.Type == "Reloading" then
+		reloading = true
+
+		statusLabel.Text = string.format(
+			"%s // RELOADING",
+			tostring(data.Weapon)
+		)
+
+	elseif data.Type == "Security" then
+		statusLabel.Text = "SOFTBOYZ // REQUEST REJECTED"
+	end
+end)
+
+---------------------------------------------------------------------
+-- VISUAL SHOT REPLICATION
+---------------------------------------------------------------------
+
+local function createTracer(origin: Vector3, target: Vector3)
+	local distance = (target - origin).Magnitude
+
+	if distance <= 0.05 then
+		return
+	end
+
+	local part = Instance.new("Part")
+	part.Name = "SoftboyzTracer"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Material = Enum.Material.Neon
+	part.Transparency = 0.15
+	part.Size = Vector3.new(0.055, 0.055, distance)
+
+	part.CFrame = CFrame.lookAt(
+		(origin + target) * 0.5,
+		target
+	)
+
+	part.Parent = workspace
+
+	Debris:AddItem(part, 0.08)
+end
+
+local function createHitMarker(position: Vector3, headshot: boolean)
+	local markerPart = Instance.new("Part")
+	markerPart.Name = "SoftboyzHit"
+	markerPart.Anchored = true
+	markerPart.CanCollide = false
+	markerPart.CanQuery = false
+	markerPart.CanTouch = false
+	markerPart.Transparency = 1
+	markerPart.Size = Vector3.new(0.1, 0.1, 0.1)
+	markerPart.Position = position
+	markerPart.Parent = workspace
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.fromOffset(120, 40)
+	billboard.StudsOffset = Vector3.new(0, 1.7, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = markerPart
+	billboard.Parent = gui
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Text = headshot and "HEADSHOT" or "HIT"
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.2
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 16
+	label.Parent = billboard
+
+	Debris:AddItem(markerPart, 0.45)
+	Debris:AddItem(billboard, 0.45)
+end
+
+ReplicateShot.OnClientEvent:Connect(function(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+
+	if data.Type ~= "Shot" then
+		return
+	end
+
+	if typeof(data.Origin) == "Vector3"
+		and typeof(data.HitPosition) == "Vector3"
+	then
+		createTracer(
+			data.Origin,
+			data.HitPosition
+		)
+	end
+
+	if data.Player == LocalPlayer and data.Hit == true then
+		if typeof(data.HitPosition) == "Vector3" then
+			createHitMarker(
+				data.HitPosition,
+				data.Headshot == true
+			)
+		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUTOMATIC WEAPONS
+---------------------------------------------------------------------
+
+task.spawn(function()
+	while true do
+		if firing then
+			local tool = getCurrentWeapon()
+
+			if tool and tool:GetAttribute("Automatic") == true then
+				fireOnce()
+			end
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+end)
+
+---------------------------------------------------------------------
+-- TOOL MONITOR
+---------------------------------------------------------------------
+
+RunService.RenderStepped:Connect(function()
+	local newTool = getCurrentWeapon()
+
+	if newTool ~= equippedTool then
+		equippedTool = newTool
+		reloading = false
+	end
+
+	updateHUD()
+end)
